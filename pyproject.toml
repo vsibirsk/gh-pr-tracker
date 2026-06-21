@@ -1,11 +1,57 @@
 [tool.ruff]
-preview = true
 line-length = 120
 fix = true
 output-format = "grouped"
+unsafe-fixes = true
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "D",      # pydocstyle — docstring enforcement
+    "G004",   # logging-f-string — f-string in logging call
+    "COM812", # missing-trailing-comma (conflicts with formatter)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "INP001", "ANN001", "S106", "E501"]
 
 [tool.ruff.format]
 exclude = [".git", ".venv", ".mypy_cache", ".tox", "__pycache__"]
+
+[project]
+name = "gh-pr-tracker"
+version = "1.0"
+requires-python = ">=3.14"
+description = "Track GitHub PRs that need your attention"
+readme = "README.md"
+dependencies = [
+    "httpx>=0.28.1",
+    "rich>=14.2.0",
+]
+
+[project.scripts]
+gh-pr-tracker = "gh_pr_tracker.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gh_pr_tracker"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+    "pytest-asyncio>=1.3.0",
+    "pytest-cov>=7.0.0",
+    "pytest-httpx>=0.36.0",
+    "ruff>=0.14.11",
+    "mypy>=1.19.1",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
 
 [tool.mypy]
 check_untyped_defs = true
