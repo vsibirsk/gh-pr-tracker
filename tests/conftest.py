@@ -54,7 +54,9 @@ def mock_classify_parts(login: str) -> MockClassifyParts:
         ],
         commits=[
             {
+                "author": {"login": "other"},
                 "commit": {
+                    "author": {"date": "2026-06-12T10:00:00Z"},
                     "committer": {"date": "2026-06-12T10:00:00Z"},
                 },
             },
@@ -105,6 +107,7 @@ def classify_input(login: str, mock_classify_parts: MockClassifyParts) -> PRClas
         commits=parts.commits,
         review_threads=parts.threads,
         issue_comments=parts.issue_comments,
+        check_runs=[],
         roles=set(),
     )
 

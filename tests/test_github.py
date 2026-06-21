@@ -35,6 +35,17 @@ async def test_search_open_prs(httpx_mock: HTTPXMock) -> None:
 
 
 @pytest.mark.asyncio
+async def test_get_commit_check_runs(httpx_mock: HTTPXMock) -> None:
+    httpx_mock.add_response(
+        url="https://api.github.com/repos/org/repo/commits/abc/check-runs?per_page=100&filter=latest",
+        json={"check_runs": [{"name": "ci", "conclusion": "success"}]},
+    )
+    client = GitHubClient(token="test-token")
+    checks = await client.get_commit_check_runs("org", "repo", "abc")
+    assert checks == [{"name": "ci", "conclusion": "success"}]
+
+
+@pytest.mark.asyncio
 async def test_http_error_mapping(httpx_mock: HTTPXMock) -> None:
     httpx_mock.add_response(url="https://api.github.com/user", status_code=401, json={"message": "Bad credentials"})
     client = GitHubClient(token="bad")

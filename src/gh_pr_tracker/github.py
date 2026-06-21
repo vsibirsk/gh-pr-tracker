@@ -243,6 +243,22 @@ class GitHubClient:
         )
         return result if isinstance(result, list) else []
 
+    async def get_commit_check_runs(
+        self,
+        owner: str,
+        repo: str,
+        ref: str,
+    ) -> list[dict[str, Any]]:
+        result = await self._request(
+            "GET",
+            f"/repos/{owner}/{repo}/commits/{ref}/check-runs",
+            params={"per_page": SEARCH_PAGE_SIZE, "filter": "latest"},
+        )
+        if not isinstance(result, dict):
+            return []
+        check_runs = result.get("check_runs")
+        return check_runs if isinstance(check_runs, list) else []
+
     async def get_pr_review_threads(
         self,
         owner: str,

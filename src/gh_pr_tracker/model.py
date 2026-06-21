@@ -35,6 +35,14 @@ STATE_VERSION = 1
 REPO_NAME_PARTS = 2
 
 
+@dataclass(frozen=True)
+class FailingCheck:
+    """A failing CI check on the PR head commit."""
+
+    name: str
+    url: str | None
+
+
 @dataclass
 class PRClassifyInput:
     """Raw GitHub API payloads for PR classification."""
@@ -45,6 +53,7 @@ class PRClassifyInput:
     commits: list[dict[str, Any]]
     review_threads: list[dict[str, Any]]
     issue_comments: list[dict[str, Any]]
+    check_runs: list[dict[str, Any]]
     roles: set[str]
 
 
@@ -151,11 +160,14 @@ class PRSnapshot:
     roles: set[str]
     head_sha: str
     created_at: datetime
-    last_push_at: datetime
+    last_author_activity_at: datetime
     unanswered: UnansweredBreakdown
     new_commits_after_review: bool | None
     others_reviews_after_mine: int
     reviews_after_mine: list[ReviewAfterMine] = field(default_factory=list)
+    labels: tuple[str, ...] = ()
+    sign_off_labels: tuple[str, ...] = ()
+    failing_checks: tuple[FailingCheck, ...] = ()
     state: str = "open"
     merged: bool = False
 

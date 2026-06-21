@@ -20,8 +20,11 @@ from gh_pr_tracker.model import (
 )
 from gh_pr_tracker.tracker import (
     classify_pr,
+    compute_failing_checks,
+    compute_last_author_activity_at,
     compute_unanswered,
     diff_snapshots,
+    extract_sign_off_labels,
     group_snapshots_by_category,
     parse_repo,
     snapshot_to_stored,
@@ -70,7 +73,7 @@ def test_display_category_priority() -> None:
         roles={ROLE_REVIEWER},
         head_sha="a",
         created_at=now,
-        last_push_at=now,
+        last_author_activity_at=now,
         unanswered=UnansweredBreakdown(mentions=1),
         new_commits_after_review=False,
         others_reviews_after_mine=0,
@@ -83,7 +86,7 @@ def test_display_category_priority() -> None:
         roles={ROLE_AUTHOR},
         head_sha="b",
         created_at=now,
-        last_push_at=now,
+        last_author_activity_at=now,
         unanswered=UnansweredBreakdown(),
         new_commits_after_review=False,
         others_reviews_after_mine=0,
@@ -96,7 +99,7 @@ def test_display_category_priority() -> None:
         roles={ROLE_REVIEWER},
         head_sha="c",
         created_at=now,
-        last_push_at=now,
+        last_author_activity_at=now,
         unanswered=UnansweredBreakdown(),
         new_commits_after_review=False,
         others_reviews_after_mine=0,
@@ -109,7 +112,7 @@ def test_display_category_priority() -> None:
         roles={ROLE_COMMENTER},
         head_sha="d",
         created_at=now,
-        last_push_at=now,
+        last_author_activity_at=now,
         unanswered=UnansweredBreakdown(),
         new_commits_after_review=False,
         others_reviews_after_mine=0,
@@ -150,7 +153,7 @@ def test_diff_snapshots() -> None:
             roles=set(),
             head_sha="sha",
             created_at=datetime.now(tz=UTC),
-            last_push_at=datetime.now(tz=UTC),
+            last_author_activity_at=datetime.now(tz=UTC),
             unanswered=UnansweredBreakdown(),
             new_commits_after_review=False,
             others_reviews_after_mine=0,
@@ -162,8 +165,76 @@ def test_diff_snapshots() -> None:
     assert "pr_closed" in types
 
 
+def test_compute_last_author_activity_at(login: str, mock_classify_parts) -> None:
+    parts = mock_classify_parts
+    created_at = datetime(2026, 6, 1, 10, 0, tzinfo=UTC)
+    latest = compute_last_author_activity_at(
+        author="other",
+        created_at=created_at,
+        commits=parts.commits,
+        reviews=parts.reviews,
+        review_threads=parts.threads,
+        issue_comments=parts.issue_comments,
+    )
+    assert latest == datetime(2026, 6, 12, 10, 0, tzinfo=UTC)
+
+    with_comment = compute_last_author_activity_at(
+        author="other",
+        created_at=created_at,
+        commits=[],
+        reviews=[],
+        review_threads=[],
+        issue_comments=[
+            {
+                "id": 1,
+                "created_at": "2026-06-20T10:00:00Z",
+                "user": {"login": "other"},
+            },
+        ],
+    )
+    assert with_comment == datetime(2026, 6, 20, 10, 0, tzinfo=UTC)
+
+
 def test_snapshot_to_stored(classify_input: PRClassifyInput) -> None:
     snapshot = classify_pr(classify_input)
     stored = snapshot_to_stored(snapshot)
     assert stored.unanswered_count == snapshot.unanswered_count
     assert stored.author == "other"
+
+
+def test_extract_sign_off_labels() -> None:
+    assert extract_sign_off_labels(["bug", "approved-qe", "lgtm-bot"]) == ("approved-qe", "lgtm-bot")
+    assert extract_sign_off_labels(["bug"]) == ()
+
+
+def test_compute_failing_checks() -> None:
+    checks = compute_failing_checks(
+        [
+            {"name": "ok", "conclusion": "success"},
+            {"name": "broken", "conclusion": "failure", "html_url": "https://example/check"},
+            {"name": "running", "conclusion": None, "status": "in_progress"},
+        ],
+    )
+    assert len(checks) == 1
+    assert checks[0].name == "broken"
+    assert checks[0].url == "https://example/check"
+
+
+def test_classify_pr_labels_and_checks(classify_input: PRClassifyInput) -> None:
+    data = classify_input
+    pull = {**data.pull, "labels": [{"name": "approved-qe"}, {"name": "bug"}]}
+    snapshot = classify_pr(
+        PRClassifyInput(
+            login=data.login,
+            pull=pull,
+            reviews=data.reviews,
+            commits=data.commits,
+            review_threads=data.review_threads,
+            issue_comments=data.issue_comments,
+            check_runs=[{"name": "unit", "conclusion": "failure"}],
+            roles=data.roles,
+        ),
+    )
+    assert snapshot.labels == ("approved-qe", "bug")
+    assert snapshot.sign_off_labels == ("approved-qe",)
+    assert snapshot.failing_checks[0].name == "unit"

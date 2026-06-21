@@ -13,11 +13,26 @@ from rich.table import Table
 from gh_pr_tracker.tracker import group_snapshots_by_category
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from types import TracebackType
 
-    from gh_pr_tracker.model import PRSnapshot, TrackerEvent
+    from gh_pr_tracker.model import PRSnapshot, ReviewAfterMine, TrackerEvent
 
 console = Console()
+
+_CELL_LINE = "\n"
+
+STATUS_TABLE_COLUMNS: Sequence[tuple[str, dict[str, Any]]] = (
+    ("#", {"style": "cyan", "width": 5, "no_wrap": True}),
+    ("Title", {"ratio": 4, "min_width": 50}),
+    ("Owner", {"min_width": 14, "no_wrap": True, "overflow": "ignore"}),
+    ("Roles", {"min_width": 12, "overflow": "ignore"}),
+    ("Age", {"width": 6, "no_wrap": True}),
+    ("Idle", {"width": 6, "no_wrap": True}),
+    ("Sign-off", {"min_width": 14, "overflow": "ignore"}),
+    ("CI", {"ratio": 2, "min_width": 18, "overflow": "ignore"}),
+    ("Pending", {"ratio": 2, "min_width": 20, "overflow": "ignore"}),
+)
 
 
 def human_age(value: datetime) -> str:
@@ -39,28 +54,66 @@ def human_age(value: datetime) -> str:
 
 def format_roles(roles: set[str]) -> str:
     order = ["author", "reviewer", "commenter", "watched"]
-    return ",".join(role for role in order if role in roles)
+    return _CELL_LINE.join(role for role in order if role in roles)
 
 
 def _rich_link(label: str, url: str) -> str:
     return f"[link={url}]{label}[/link]"
 
 
-def _thread_flag_links(label: str, urls: list[str]) -> list[str]:
-    return [_rich_link(f"{label}(1)", url) for url in urls]
+def _styled_link(label: str, url: str, *, style: str) -> str:
+    return f"[{style}][link={url}]{label}[/link][/{style}]"
 
 
-def format_attention_flags(snapshot: PRSnapshot) -> str:
+def _grouped_thread_link(label: str, urls: list[str], *, style: str = "") -> str | None:
+    if not urls:
+        return None
+    text = f"{label}({len(urls)})"
+    if style:
+        return _styled_link(text, urls[0], style=style)
+    return _rich_link(text, urls[0])
+
+
+def _review_links(reviews: list[ReviewAfterMine]) -> list[str]:
+    return [
+        _styled_link(f"reviews(1): {review.reviewer}", review.url, style="magenta")
+        for review in reviews
+    ]
+
+
+def format_pending_flags(snapshot: PRSnapshot) -> str:
     parts: list[str] = []
-    parts.extend(_thread_flag_links("started threads", snapshot.unanswered.threads_started_urls))
-    parts.extend(_thread_flag_links("joined threads", snapshot.unanswered.threads_joined_urls))
-    parts.extend(_thread_flag_links("mention", snapshot.unanswered.mention_urls))
+    for label, urls, style in (
+        ("started", snapshot.unanswered.threads_started_urls, ""),
+        ("joined", snapshot.unanswered.threads_joined_urls, ""),
+        ("mention", snapshot.unanswered.mention_urls, "yellow"),
+    ):
+        link = _grouped_thread_link(label, urls, style=style)
+        if link:
+            parts.append(link)
     if snapshot.new_commits_after_review:
         parts.append(_rich_link("new-commits", f"{snapshot.url}/commits/{snapshot.head_sha}"))
-    parts.extend(
-        _rich_link(f"new-reviews({review.reviewer})", review.url) for review in snapshot.reviews_after_mine
-    )
-    return "  ".join(parts)
+    parts.extend(_review_links(snapshot.reviews_after_mine))
+    return _CELL_LINE.join(parts)
+
+
+def format_sign_off_labels(snapshot: PRSnapshot) -> str:
+    if not snapshot.sign_off_labels:
+        return "-"
+    return _CELL_LINE.join(f"[green]{label}[/green]" for label in snapshot.sign_off_labels)
+
+
+def format_ci_checks(snapshot: PRSnapshot) -> str:
+    if not snapshot.failing_checks:
+        return "[green]all pass[/green]"
+    return _CELL_LINE.join(f"[red]{check.name}[/red]" for check in snapshot.failing_checks)
+
+
+def _build_status_table(*, title: str) -> Table:
+    table = Table(title=title, expand=True, show_lines=True)
+    for name, kwargs in STATUS_TABLE_COLUMNS:
+        table.add_column(name, **kwargs)
+    return table
 
 
 def render_status_table(snapshots: list[PRSnapshot]) -> None:
@@ -72,27 +125,19 @@ def render_status_table(snapshots: list[PRSnapshot]) -> None:
     for index, (category, items) in enumerate(sections):
         if index:
             console.print()
-        table = Table(title=category.capitalize())
-        table.add_column("#", style="cyan", no_wrap=True)
-        table.add_column("Title", max_width=40)
-        table.add_column("Owner", no_wrap=True)
-        table.add_column("Roles")
-        table.add_column("Age", no_wrap=True)
-        table.add_column("Push", no_wrap=True)
-        table.add_column("Unans.", no_wrap=True)
-        table.add_column("Flags")
-
+        table = _build_status_table(title=category.capitalize())
         for snapshot in items:
-            flags = format_attention_flags(snapshot)
+            pending = format_pending_flags(snapshot)
             table.add_row(
                 _rich_link(str(snapshot.number), snapshot.url),
                 snapshot.title,
                 snapshot.author or "-",
                 format_roles(snapshot.roles),
                 human_age(snapshot.created_at),
-                human_age(snapshot.last_push_at),
-                str(snapshot.unanswered_count),
-                flags or "-",
+                human_age(snapshot.last_author_activity_at),
+                format_sign_off_labels(snapshot),
+                format_ci_checks(snapshot),
+                pending or "-",
             )
         console.print(table)
 
@@ -112,13 +157,17 @@ def render_diff(events: list[TrackerEvent]) -> None:
 
 
 def render_pr_detail(snapshot: PRSnapshot) -> None:
+    sign_off = ", ".join(snapshot.sign_off_labels) if snapshot.sign_off_labels else "-"
+    ci = ", ".join(check.name for check in snapshot.failing_checks) if snapshot.failing_checks else "all pass"
     lines = [
         f"PR #{snapshot.number}: {snapshot.title}",
         f"State: {snapshot.state}" + (" (merged)" if snapshot.merged else ""),
         f"Owner: {snapshot.author or '-'}",
         f"Roles: {format_roles(snapshot.roles) or '-'}",
-        f"Opened: {human_age(snapshot.created_at)} ago · Last push: {human_age(snapshot.last_push_at)} ago",
+        f"Opened: {human_age(snapshot.created_at)} ago · Author idle: {human_age(snapshot.last_author_activity_at)}",
         f"Head SHA: {snapshot.head_sha}",
+        f"Sign-off labels: {sign_off}",
+        f"CI: {ci}",
         "",
         "Unanswered breakdown:",
         f"  started threads: {snapshot.unanswered.threads_started}",
@@ -158,7 +207,12 @@ def snapshot_to_json(snapshot: PRSnapshot) -> dict[str, Any]:
         "roles": sorted(snapshot.roles),
         "head_sha": snapshot.head_sha,
         "created_at": snapshot.created_at.astimezone(UTC).isoformat(),
-        "last_push_at": snapshot.last_push_at.astimezone(UTC).isoformat(),
+        "last_author_activity_at": snapshot.last_author_activity_at.astimezone(UTC).isoformat(),
+        "labels": list(snapshot.labels),
+        "sign_off_labels": list(snapshot.sign_off_labels),
+        "failing_checks": [
+            {"name": check.name, "url": check.url} for check in snapshot.failing_checks
+        ],
         "unanswered_count": snapshot.unanswered_count,
         "unanswered": {
             "started_threads": {
@@ -174,7 +228,7 @@ def snapshot_to_json(snapshot: PRSnapshot) -> dict[str, Any]:
                 "urls": snapshot.unanswered.mention_urls,
             },
         },
-        "flags": {
+        "pending": {
             "new_commits": {
                 "active": snapshot.new_commits_after_review is True,
                 "url": f"{snapshot.url}/commits/{snapshot.head_sha}" if snapshot.new_commits_after_review else None,

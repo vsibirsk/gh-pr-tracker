@@ -19,6 +19,7 @@ from gh_pr_tracker.model import (
     CollectConfig,
     DiffState,
     DiscoverConfig,
+    FailingCheck,
     PRClassifyInput,
     PRFetchRequest,
     PRSnapshot,
@@ -33,17 +34,29 @@ if TYPE_CHECKING:
 
 ProgressCallback = Callable[[str], None]
 
+SIGN_OFF_PREFIXES = ("approved-", "lgtm-")
+FAILING_CHECK_CONCLUSIONS = frozenset(
+    {
+        "failure",
+        "timed_out",
+        "cancelled",
+        "action_required",
+        "startup_failure",
+        "stale",
+    },
+)
+
 _CATEGORY_ORDER = {name: index for index, name in enumerate(DISPLAY_CATEGORIES)}
 
 
 def sort_snapshots(snapshots: list[PRSnapshot]) -> list[PRSnapshot]:
-    """Sort by display category priority, then attention, then oldest push."""
+    """Sort by display category priority, then attention, then oldest author activity."""
     return sorted(
         snapshots,
         key=lambda item: (
             _CATEGORY_ORDER.get(item.display_category(), len(_CATEGORY_ORDER)),
             not item.needs_attention,
-            item.last_push_at,
+            item.last_author_activity_at,
         ),
     )
 
@@ -329,17 +342,101 @@ def _review_signals(
     return new_commits, reviews_after_mine
 
 
-def _last_push_at(commits: list[dict[str, Any]], *, fallback: datetime) -> datetime:
-    if not commits:
-        return fallback
-    last = commits[-1]
-    commit = last.get("commit") or {}
-    committer = commit.get("committer") or commit.get("author") or {}
-    date = committer.get("date")
-    parsed = _parse_github_datetime(str(date) if date else None)
-    if parsed == datetime.min.replace(tzinfo=UTC):
-        return fallback
-    return parsed
+def _last_author_push_at(
+    *,
+    author: str,
+    commits: list[dict[str, Any]],
+) -> datetime | None:
+    latest: datetime | None = None
+    for commit in commits:
+        commit_author = commit.get("author") or {}
+        login = commit_author.get("login") if isinstance(commit_author, dict) else None
+        if login != author:
+            continue
+        commit_data = commit.get("commit") or {}
+        author_block = commit_data.get("author") or commit_data.get("committer") or {}
+        parsed = _parse_github_datetime(str(author_block.get("date") or ""))
+        if parsed == datetime.min.replace(tzinfo=UTC):
+            continue
+        if latest is None or parsed > latest:
+            latest = parsed
+    return latest
+
+
+def _max_datetime(*values: datetime | None) -> datetime | None:
+    present = [value for value in values if value is not None]
+    return max(present) if present else None
+
+
+def compute_last_author_activity_at(
+    *,
+    author: str,
+    created_at: datetime,
+    commits: list[dict[str, Any]],
+    reviews: list[dict[str, Any]],
+    review_threads: list[dict[str, Any]],
+    issue_comments: list[dict[str, Any]],
+) -> datetime:
+    issue_comment_times = [
+        _parse_github_datetime(str(comment.get("created_at") or ""))
+        for comment in issue_comments
+        if _comment_login(comment) == author
+    ]
+    review_times = [
+        _parse_github_datetime(str(review.get("submitted_at") or ""))
+        for review in reviews
+        if review.get("state") != "PENDING"
+        and _comment_login(review) == author
+        and review.get("submitted_at")
+    ]
+    thread_comment_times: list[datetime] = []
+    for thread in review_threads:
+        for comment in _thread_comments(thread):
+            if _comment_login(comment) != author:
+                continue
+            thread_comment_times.append(_parse_github_datetime(str(comment.get("createdAt") or "")))
+
+    latest = _max_datetime(
+        _last_author_push_at(author=author, commits=commits),
+        _max_datetime(*issue_comment_times) if issue_comment_times else None,
+        _max_datetime(*review_times) if review_times else None,
+        _max_datetime(*thread_comment_times) if thread_comment_times else None,
+    )
+    return latest or created_at
+
+
+def _pull_label_names(pull: dict[str, Any]) -> tuple[str, ...]:
+    raw_labels = pull.get("labels") or []
+    names = sorted(
+        str(label.get("name"))
+        for label in raw_labels
+        if isinstance(label, dict) and label.get("name")
+    )
+    return tuple(names)
+
+
+def extract_sign_off_labels(labels: list[str] | tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(sorted(label for label in labels if label.startswith(SIGN_OFF_PREFIXES)))
+
+
+def compute_failing_checks(check_runs: list[dict[str, Any]]) -> tuple[FailingCheck, ...]:
+    failing: list[FailingCheck] = []
+    for check_run in check_runs:
+        conclusion = check_run.get("conclusion")
+        if conclusion not in FAILING_CHECK_CONCLUSIONS:
+            continue
+        name = check_run.get("name")
+        if not name:
+            continue
+        html_url = check_run.get("html_url")
+        failing.append(
+            FailingCheck(
+                name=str(name),
+                url=str(html_url) if html_url else None,
+            ),
+        )
+    failing.sort(key=lambda item: item.name)
+    return tuple(failing)
 
 
 def classify_pr(data: PRClassifyInput) -> PRSnapshot:
@@ -363,6 +460,7 @@ def classify_pr(data: PRClassifyInput) -> PRSnapshot:
         head_sha=head_sha,
         reviews=data.reviews,
     )
+    labels = _pull_label_names(data.pull)
     return PRSnapshot(
         number=int(data.pull["number"]),
         title=str(data.pull.get("title") or ""),
@@ -371,11 +469,21 @@ def classify_pr(data: PRClassifyInput) -> PRSnapshot:
         roles=merged_roles,
         head_sha=head_sha,
         created_at=created_at,
-        last_push_at=_last_push_at(data.commits, fallback=created_at),
+        last_author_activity_at=compute_last_author_activity_at(
+            author=author,
+            created_at=created_at,
+            commits=data.commits,
+            reviews=data.reviews,
+            review_threads=data.review_threads,
+            issue_comments=data.issue_comments,
+        ),
         unanswered=unanswered,
         new_commits_after_review=new_commits,
         others_reviews_after_mine=len(reviews_after_mine),
         reviews_after_mine=reviews_after_mine,
+        labels=labels,
+        sign_off_labels=extract_sign_off_labels(labels),
+        failing_checks=compute_failing_checks(data.check_runs),
         state=str(data.pull.get("state") or "open"),
         merged=bool(data.pull.get("merged")),
     )
@@ -406,7 +514,7 @@ def stored_to_snapshot(number: int, stored: StoredPR, roles: set[str] | None = N
         roles=roles or set(),
         head_sha=stored.head_sha,
         created_at=now,
-        last_push_at=now,
+        last_author_activity_at=now,
         unanswered=UnansweredBreakdown(
             threads_started=stored.threads_started,
             threads_joined=stored.threads_joined,
@@ -454,19 +562,24 @@ async def _fetch_pr_payload(client: GitHubClient, request: PRFetchRequest) -> tu
     list[dict[str, Any]],
     list[dict[str, Any]],
     list[dict[str, Any]],
+    list[dict[str, Any]],
 ]:
-    return await asyncio.gather(
-        client.get_pr_details(request.owner, request.repo, request.number),
+    pull = await client.get_pr_details(request.owner, request.repo, request.number)
+    head = pull.get("head") or {}
+    head_sha = str(head.get("sha") or "")
+    reviews, commits, threads, issue_comments, check_runs = await asyncio.gather(
         client.get_pr_reviews(request.owner, request.repo, request.number),
         client.get_pull_commits(request.owner, request.repo, request.number),
         client.get_pr_review_threads(request.owner, request.repo, request.number),
         client.get_issue_comments(request.owner, request.repo, request.number),
+        client.get_commit_check_runs(request.owner, request.repo, head_sha),
     )
+    return pull, reviews, commits, threads, issue_comments, check_runs
 
 
 async def fetch_pr_snapshot(client: GitHubClient, request: PRFetchRequest) -> PRSnapshot | None:
     try:
-        pull, reviews, commits, threads, issue_comments = await _fetch_pr_payload(client, request)
+        pull, reviews, commits, threads, issue_comments, check_runs = await _fetch_pr_payload(client, request)
     except ValueError:
         return None
 
@@ -481,6 +594,7 @@ async def fetch_pr_snapshot(client: GitHubClient, request: PRFetchRequest) -> PR
             commits=commits,
             review_threads=threads,
             issue_comments=issue_comments,
+            check_runs=check_runs,
             roles=request.roles,
         ),
     )
@@ -488,7 +602,7 @@ async def fetch_pr_snapshot(client: GitHubClient, request: PRFetchRequest) -> PR
 
 async def fetch_pr_detail_any_state(client: GitHubClient, request: PRFetchRequest) -> PRSnapshot | None:
     try:
-        pull, reviews, commits, threads, issue_comments = await _fetch_pr_payload(client, request)
+        pull, reviews, commits, threads, issue_comments, check_runs = await _fetch_pr_payload(client, request)
     except ValueError:
         return None
 
@@ -500,6 +614,7 @@ async def fetch_pr_detail_any_state(client: GitHubClient, request: PRFetchReques
             commits=commits,
             review_threads=threads,
             issue_comments=issue_comments,
+            check_runs=check_runs,
             roles=request.roles,
         ),
     )
